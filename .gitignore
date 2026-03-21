@@ -1,0 +1,45 @@
+# Environment
+.env
+.env.save
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Project runtime files
+logs/
+charts/
+data/signals.db
+data/*.db
+
+# Keep data dir but ignore content
+!data/.gitkeep
+!logs/.gitkeep
+!charts/.gitkeep
+
+# Docker
+.docker/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backups
+*_backup*.py
+*_backup/

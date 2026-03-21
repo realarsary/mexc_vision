@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    container_name: mexc_signal_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./charts:/app/charts
+      - ./data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
