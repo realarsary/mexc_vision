@@ -1,6 +1,6 @@
 """
 services/mexc/api_client.py
-MEXC REST API client — clean, no duplicates, with rate limiting
+MEXC REST API client — clean, without duplicates, with rate limiting
 """
 
 import asyncio
@@ -49,7 +49,7 @@ class APIError(Exception):
 
 
 class RateLimitError(APIError):
-    """Rate limit exceeded"""
+    """Request rate limit exceeded"""
     pass
 
 
@@ -137,7 +137,7 @@ class MexcClient:
             logger.info("🔒 MexcClient stopped")
 
     # ----------------------------------------------------------
-    # PRIVATE
+    # PRIVATE METHODS
     # ----------------------------------------------------------
     async def _get(
         self,
@@ -151,7 +151,7 @@ class MexcClient:
         if self._session is None:
             raise APIError("Session not started. Call await client.start()")
 
-        # Simple rate limiter — minimum interval between requests
+        # Simple rate limiter — minimal interval between requests
         async with self._rate_limiter:
             now = time.monotonic()
             wait = (1.0 / REQUESTS_PER_SECOND) - (now - self._last_request_time)
@@ -170,7 +170,7 @@ class MexcClient:
                     if resp.status == 429:
                         self._metrics.on_rate_limit()
                         wait_time = 2 ** attempt
-                        logger.warning(f"⚠️ Rate limit MEXC, waiting {wait_time}s")
+                        logger.warning(f"⚠️ MEXC rate limit, waiting {wait_time}s")
                         await asyncio.sleep(wait_time)
                         continue
 
@@ -187,13 +187,12 @@ class MexcClient:
                 self._metrics.on_retry()
                 wait_time = 0.5 * attempt
                 logger.warning(
-                    f"⚠️ Attempt {attempt}/{retries} for {path}: {e}. "
-                    f"Waiting {wait_time}s"
+                    f"⚠️ Attempt {attempt}/{retries} for {path}: {e}. Waiting {wait_time}s"
                 )
                 await asyncio.sleep(wait_time)
 
         self._metrics.on_failure()
-        raise APIError(f"Failed to execute request {path} after {retries} attempts: {last_error}")
+        raise APIError(f"Failed to perform request {path} after {retries} attempts: {last_error}")
 
     # ----------------------------------------------------------
     # PUBLIC API
@@ -213,10 +212,10 @@ class MexcClient:
         limit: int = 100,
     ) -> List[float]:
         """
-        Get list of candle close prices.
+        Get a list of candle close prices.
 
         Args:
-            symbol: Trading pair, e.g. "BTC_USDT"
+            symbol: Trading pair, e.g., "BTC_USDT"
             interval: "1m", "15m", "1h", "4h", etc.
             limit: Number of candles
 
@@ -253,7 +252,7 @@ class MexcClient:
             return []
 
     async def get_ticker_price(self, symbol: str) -> Optional[float]:
-        """Get current price of a pair"""
+        """Get current pair price"""
         try:
             data = await self._get(
                 "/api/v1/contract/ticker",
@@ -262,11 +261,11 @@ class MexcClient:
             price = data.get("data", {}).get("lastPrice")
             return float(price) if price else None
         except (APIError, ValueError, TypeError) as e:
-            logger.error(f"Price fetching error {symbol}: {e}")
+            logger.error(f"Error getting price {symbol}: {e}")
             return None
 
     async def get_all_symbols(self) -> List[str]:
-        """Get list of all USDT futures pairs"""
+        """Get all USDT futures trading pairs"""
         try:
             data = await self._get("/api/v1/contract/detail")
             contracts = data.get("data", [])
@@ -275,10 +274,10 @@ class MexcClient:
                 for c in contracts
                 if isinstance(c, dict)
                 and c.get("symbol", "").endswith("_USDT")
-                and c.get("state") == 1  # only active
+                and c.get("state") == 0  # 0 = active MEXC contract
             ]
         except APIError as e:
-            logger.error(f"Symbols fetching error: {e}")
+            logger.error(f"Error fetching symbols: {e}")
             return []
 
     def get_metrics(self) -> Dict[str, Any]:
