@@ -224,13 +224,14 @@ class MexcClient:
         """
         mexc_interval = _to_mexc_interval(interval)
         params = {
-            "symbol": symbol,
             "interval": mexc_interval,
             "limit": limit,
+            "start": "",
+            "end": "",
         }
 
         try:
-            data = await self._get("/api/v1/contract/kline", params=params)
+            data = await self._get(f"/api/v1/contract/kline/{symbol}", params=params)
         except APIError as e:
             logger.error(f"Klines error {symbol} {interval}: {e}")
             return []
