@@ -1,6 +1,16 @@
 """
 main.py
-Main entry point for MEXC Signal Bot
+MEXC Signal Bot — WS-first architecture
+
+Flow:
+1. WS receives real-time price ticks → stored in RAM (deque per symbol)
+2. Every CHECK_INTERVAL seconds:
+   a. Filter 1: price change over 15 min >= ±PRICE_CHANGE_THRESHOLD%  (pure RAM, no REST)
+   b. Only for symbols that passed filter 1:
+      Filter 2: RSI 1h overbought/oversold                             (1 REST call)
+   c. Only for symbols that passed filter 2:
+      Filter 3: RSI 15m overbought/oversold                           (1 REST call)
+   d. Signal → save to DB → send to Telegram
 """
 
 import asyncio
@@ -21,6 +31,8 @@ from config.settings import (
     SIGNAL_COOLDOWN,
     PRICE_CHANGE_THRESHOLD,
     RSI_PERIOD,
+    RSI_OVERBOUGHT,
+    RSI_OVERSOLD,
     SEND_CHART,
     TRADING_PAIRS_WHITELIST,
     TRADING_PAIRS_BLACKLIST,
@@ -32,6 +44,7 @@ from config.settings import (
 from database import Database
 from services.mexc import MexcClient, MexcWSClient
 from services.analysis import SignalAnalyzer, SignalResult
+from services.analysis.rsi import RSICalculator
 from bot.services import TelegramService
 from bot.handlers import setup as setup_handlers
 from bot.utils import ChartGenerator
@@ -67,7 +80,6 @@ def setup_logging() -> None:
     root.addHandler(file_handler)
     root.addHandler(console_handler)
 
-    # Silence noisy libraries
     for noisy in ("aiohttp", "aiogram", "websockets", "matplotlib"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -76,12 +88,12 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# KLINES CACHE  (TTL = 30 sec, reduces REST requests)
+# KLINES CACHE  (TTL = 30 sec)
 # ============================================================
 class _KlinesCache:
     def __init__(self, ttl: float = 30.0):
         self._ttl = ttl
-        self._store: Dict[str, tuple] = {}  # key → (timestamp, data)
+        self._store: Dict[str, tuple] = {}
 
     def get(self, key: str) -> Optional[List[float]]:
         import time
@@ -103,14 +115,18 @@ class _KlinesCache:
 # ============================================================
 class Monitor:
     """
-    Main monitor — combines WS, REST, analysis, and Telegram sending.
+    WS-first monitor.
 
-    Workflow:
-    1. WS receives real-time prices
-    2. Every CHECK_INTERVAL seconds — pre-filter symbols by price change
-    3. For pre-filtered symbols — fetch klines via REST
-    4. Run full analysis (RSI 1h + RSI 15m)
-    5. If signal → save to DB → send to Telegram
+    Filter 1 — pure RAM (WS ticks):
+        price change over 15 min >= ±PRICE_CHANGE_THRESHOLD%
+
+    Filter 2 — REST only if filter 1 passed:
+        RSI 1h overbought (> RSI_OVERBOUGHT) or oversold (< RSI_OVERSOLD)
+
+    Filter 3 — REST only if filter 2 passed:
+        RSI 15m overbought or oversold
+
+    Signal → DB → Telegram
     """
 
     def __init__(
@@ -132,19 +148,18 @@ class Monitor:
 
         self._stats = {
             "cycles": 0,
-            "checked": 0,
+            "f1_passed": 0,
+            "f2_passed": 0,
             "signals": 0,
             "errors": 0,
+            "rest_calls": 0,
         }
 
     async def start(self, symbols: List[str]) -> None:
         self._symbols = symbols
         self._running = True
 
-        self._ws = MexcWSClient(
-            symbols=symbols,
-            on_price_update=self._on_price_update,
-        )
+        self._ws = MexcWSClient(symbols=symbols)
         await self._ws.start()
 
         await self._loop()
@@ -154,15 +169,11 @@ class Monitor:
         if self._ws:
             await self._ws.stop()
 
-    def _on_price_update(self, symbol: str, price: float) -> None:
-        """WS callback — update price cache (non-blocking)"""
-        pass  # prices stored internally in MexcWSClient._prices
-
     async def _loop(self) -> None:
-        """Main checking loop"""
         import time
 
         logger.info(f"🚀 Monitor started | {len(self._symbols)} symbols | interval {CHECK_INTERVAL}s")
+        logger.info(f"⏳ Waiting 15 minutes to accumulate ticks before first cycle...")
 
         while self._running:
             cycle_start = time.monotonic()
@@ -182,68 +193,103 @@ class Monitor:
             await asyncio.sleep(sleep_time)
 
     async def _run_cycle(self) -> None:
-        """One cycle of checking all symbols"""
-        import asyncio
+        ready_count = self._ws.symbols_ready_count()
 
-        prices = self._ws.get_all_prices() if self._ws else {}
-
-        if not prices:
-            logger.warning("⚠️ WS returned no prices — skipping cycle")
+        if ready_count == 0:
+            logger.warning("⏳ No symbols with 15min data yet — waiting...")
             return
 
-        candidates = []
+        logger.debug(f"📊 {ready_count} symbols have 15min data")
+
+        # --- FILTER 1: price change over 15 min (pure RAM, no REST) ---
+        f1_candidates = []
         for symbol in self._symbols:
-            if symbol not in prices:
-                continue
             on_cd = await self._db.is_on_cooldown(symbol, SIGNAL_COOLDOWN)
-            if not on_cd:
-                candidates.append(symbol)
+            if on_cd:
+                continue
 
-        if not candidates:
+            change = self._ws.get_price_change_15m(symbol)
+            if change is None:
+                continue
+
+            if abs(change) >= PRICE_CHANGE_THRESHOLD:
+                f1_candidates.append((symbol, change))
+                logger.debug(f"✅ F1 passed: {symbol} {change:+.2f}%")
+
+        if not f1_candidates:
+            logger.debug("No symbols passed filter 1")
             return
 
-        logger.debug(f"🔍 Checking {len(candidates)} symbols")
+        self._stats["f1_passed"] += len(f1_candidates)
+        logger.info(f"🔍 Filter 1 passed: {len(f1_candidates)} symbols | {[s for s,_ in f1_candidates]}")
 
-        sem = asyncio.Semaphore(20)
+        # --- FILTER 2 + 3: RSI via REST (only for f1 candidates) ---
+        sem = asyncio.Semaphore(5)
 
-        async def check(symbol: str) -> None:
+        async def check(symbol: str, price_change: float) -> None:
             async with sem:
-                await self._check_symbol(symbol, prices[symbol])
+                await self._check_rsi(symbol, price_change)
 
-        await asyncio.gather(*[check(s) for s in candidates], return_exceptions=True)
-        self._stats["checked"] += len(candidates)
+        await asyncio.gather(
+            *[check(s, c) for s, c in f1_candidates],
+            return_exceptions=True,
+        )
 
-    async def _check_symbol(self, symbol: str, current_price: float) -> None:
-        """Check one symbol"""
+    async def _check_rsi(self, symbol: str, price_change: float) -> None:
+        """Filter 2 (RSI 1h) and Filter 3 (RSI 15m) via REST"""
         try:
-            prices_1m = await self._get_klines(symbol, "1m", 20)
-            if not prices_1m or len(prices_1m) < 15:
+            current_price = self._ws.get_price(symbol)
+            if not current_price:
                 return
 
+            # --- FILTER 2: RSI 1h ---
             prices_1h = await self._get_klines(symbol, "1h", 100)
-            prices_15m = await self._get_klines(symbol, "15m", 60)
-
-            if not prices_1h or not prices_15m:
+            if not prices_1h or not RSICalculator.is_valid(prices_1h, RSI_PERIOD):
                 return
 
-            result: SignalResult = SignalAnalyzer.analyze(
+            self._stats["rest_calls"] += 1
+            rsi_1h = RSICalculator.last(prices_1h, RSI_PERIOD)
+
+            if not (rsi_1h > RSI_OVERBOUGHT or rsi_1h < RSI_OVERSOLD):
+                logger.debug(f"❌ F2 failed: {symbol} RSI 1h={rsi_1h:.1f}")
+                return
+
+            self._stats["f2_passed"] += 1
+            logger.debug(f"✅ F2 passed: {symbol} RSI 1h={rsi_1h:.1f}")
+
+            # --- FILTER 3: RSI 15m ---
+            prices_15m = await self._get_klines(symbol, "15m", 60)
+            if not prices_15m or not RSICalculator.is_valid(prices_15m, RSI_PERIOD):
+                return
+
+            self._stats["rest_calls"] += 1
+            rsi_15m = RSICalculator.last(prices_15m, RSI_PERIOD)
+
+            if not (rsi_15m > RSI_OVERBOUGHT or rsi_15m < RSI_OVERSOLD):
+                logger.debug(f"❌ F3 failed: {symbol} RSI 15m={rsi_15m:.1f}")
+                return
+
+            logger.debug(f"✅ F3 passed: {symbol} RSI 15m={rsi_15m:.1f}")
+
+            # --- ALL 3 FILTERS PASSED → SIGNAL ---
+            direction = _get_direction(price_change, rsi_1h, rsi_15m)
+            await self._handle_signal(
                 symbol=symbol,
-                prices_1m=prices_1m,
-                prices_15m=prices_15m,
-                prices_1h=prices_1h,
                 current_price=current_price,
+                price_change=price_change,
+                rsi_1h=rsi_1h,
+                rsi_15m=rsi_15m,
+                direction=direction,
+                prices_1h=prices_1h,
+                prices_15m=prices_15m,
             )
 
-            if result.triggered:
-                await self._handle_signal(result, prices_1h, prices_15m)
-
         except Exception as e:
-            logger.error(f"Error checking {symbol}: {e}")
+            logger.error(f"Error checking RSI for {symbol}: {e}")
 
     async def _get_klines(
         self, symbol: str, interval: str, limit: int
     ) -> Optional[List[float]]:
-        """Fetch klines — first cache, then REST"""
         key = f"{symbol}:{interval}"
         cached = self._cache.get(key)
         if cached:
@@ -256,33 +302,40 @@ class Monitor:
 
     async def _handle_signal(
         self,
-        result: SignalResult,
+        symbol: str,
+        current_price: float,
+        price_change: float,
+        rsi_1h: float,
+        rsi_15m: float,
+        direction: str,
         prices_1h: List[float],
         prices_15m: List[float],
     ) -> None:
-        """Handle signal — save to DB and send to Telegram"""
-        symbol = result.symbol
-
         await self._db.save_signal(
             symbol=symbol,
-            price=result.current_price,
-            price_change=result.filter_price.value,
-            rsi_1h=result.filter_rsi_1h.value,
-            rsi_15m=result.filter_rsi_15m.value,
-            direction=result.direction,
+            price=current_price,
+            price_change=price_change,
+            rsi_1h=rsi_1h,
+            rsi_15m=rsi_15m,
+            direction=direction,
         )
-
         await self._db.set_cooldown(symbol)
         self._stats["signals"] += 1
 
         logger.info(
-            f"🚨 SIGNAL {result.direction} {symbol} | "
-            f"Price: {result.current_price:.4f} ({result.filter_price.value:+.2f}%) | "
-            f"RSI 1h: {result.filter_rsi_1h.value:.1f} | "
-            f"RSI 15m: {result.filter_rsi_15m.value:.1f}"
+            f"🚨 SIGNAL {direction} {symbol} | "
+            f"Price: {current_price:.4f} ({price_change:+.2f}% / 15m) | "
+            f"RSI 1h: {rsi_1h:.1f} | RSI 15m: {rsi_15m:.1f}"
         )
 
-        text = _build_signal_message(result)
+        text = _build_signal_message(
+            symbol=symbol,
+            current_price=current_price,
+            price_change=price_change,
+            rsi_1h=rsi_1h,
+            rsi_15m=rsi_15m,
+            direction=direction,
+        )
 
         chart_path = None
         if SEND_CHART:
@@ -290,11 +343,11 @@ class Monitor:
                 symbol=symbol,
                 prices_1h=prices_1h,
                 prices_15m=prices_15m,
-                current_price=result.current_price,
-                direction=result.direction,
-                price_change=result.filter_price.value,
-                rsi_1h=result.filter_rsi_1h.value,
-                rsi_15m=result.filter_rsi_15m.value,
+                current_price=current_price,
+                direction=direction,
+                price_change=price_change,
+                rsi_1h=rsi_1h,
+                rsi_15m=rsi_15m,
             )
 
         await self._tg.send_signal(text=text, photo_path=chart_path)
@@ -303,12 +356,16 @@ class Monitor:
         ws_metrics = self._ws.get_metrics() if self._ws else {}
         api_metrics = self._api.get_metrics()
         tg_metrics = self._tg.get_metrics()
+        ready = self._ws.symbols_ready_count() if self._ws else 0
 
         logger.info(
             f"📊 Stats | "
             f"Cycles: {self._stats['cycles']} | "
-            f"Checked: {self._stats['checked']} | "
+            f"Ready: {ready}/{len(self._symbols)} | "
+            f"F1: {self._stats['f1_passed']} | "
+            f"F2: {self._stats['f2_passed']} | "
             f"Signals: {self._stats['signals']} | "
+            f"REST calls: {self._stats['rest_calls']} | "
             f"Errors: {self._stats['errors']}"
         )
         logger.info(f"   API: {api_metrics}")
@@ -317,20 +374,40 @@ class Monitor:
 
 
 # ============================================================
-# SIGNAL MESSAGE BUILDER
+# HELPERS
 # ============================================================
-def _build_signal_message(result: SignalResult) -> str:
-    direction_emoji = "🟢" if result.direction == "LONG" else "🔴"
-    direction_text = "LONG (buy)" if result.direction == "LONG" else "SHORT (sell)"
+def _get_direction(price_change: float, rsi_1h: float, rsi_15m: float) -> str:
+    price_up = price_change > 0
+    rsi_oversold = rsi_1h < RSI_OVERSOLD or rsi_15m < RSI_OVERSOLD
+    rsi_overbought = rsi_1h > RSI_OVERBOUGHT or rsi_15m > RSI_OVERBOUGHT
+
+    if price_up and rsi_oversold:
+        return "LONG"
+    if not price_up and rsi_overbought:
+        return "SHORT"
+    return "LONG" if price_up else "SHORT"
+
+
+def _build_signal_message(
+    symbol: str,
+    current_price: float,
+    price_change: float,
+    rsi_1h: float,
+    rsi_15m: float,
+    direction: str,
+) -> str:
+    emoji = "🟢" if direction == "LONG" else "🔴"
+    label = "LONG (buy)" if direction == "LONG" else "SHORT (sell)"
+
+    rsi_1h_zone = "overbought" if rsi_1h > RSI_OVERBOUGHT else "oversold"
+    rsi_15m_zone = "overbought" if rsi_15m > RSI_OVERBOUGHT else "oversold"
 
     return (
-        f"{direction_emoji} <b>{result.symbol}</b> — {direction_text}\n\n"
-        f"💰 Price:    <code>{result.current_price:.6f} USDT</code>\n"
-        f"📈 Change: <code>{result.filter_price.value:+.2f}%</code> over 15m\n\n"
-        f"📊 RSI (1h):  <code>{result.filter_rsi_1h.value:.1f}</code>\n"
-        f"📊 RSI (15m): <code>{result.filter_rsi_15m.value:.1f}</code>\n\n"
-        f"<i>{result.filter_rsi_1h.description}</i>\n"
-        f"<i>{result.filter_rsi_15m.description}</i>"
+        f"{emoji} <b>{symbol}</b> — {label}\n\n"
+        f"💰 Price:    <code>{current_price:.6f} USDT</code>\n"
+        f"📈 Change: <code>{price_change:+.2f}%</code> over 15m\n\n"
+        f"📊 RSI (1h):  <code>{rsi_1h:.1f}</code> — {rsi_1h_zone}\n"
+        f"📊 RSI (15m): <code>{rsi_15m:.1f}</code> — {rsi_15m_zone}"
     )
 
 
@@ -338,7 +415,6 @@ def _build_signal_message(result: SignalResult) -> str:
 # SYMBOLS LOADER
 # ============================================================
 async def _load_symbols(api: MexcClient) -> List[str]:
-    """Load symbols list: from file or API"""
     symbols_file = Path("data/symbols_usdt.txt")
 
     if symbols_file.exists():
@@ -371,7 +447,6 @@ async def _load_symbols(api: MexcClient) -> List[str]:
 # AIOGRAM BOT POLLER
 # ============================================================
 async def _run_bot_polling(db: Database) -> None:
-    """Start aiogram polling in background"""
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     router = setup_handlers(db)
@@ -417,9 +492,10 @@ async def main() -> None:
     await tg.send_message(
         f"🚀 <b>MEXC Signal Bot started</b>\n\n"
         f"📊 Monitoring <b>{len(symbols)}</b> symbols\n"
-        f"⏱ Interval: {CHECK_INTERVAL}s\n"
+        f"⏱ Check interval: {CHECK_INTERVAL}s\n"
         f"📈 Price threshold: ±{PRICE_CHANGE_THRESHOLD}%\n"
-        f"🔄 Cooldown: {SIGNAL_COOLDOWN}s"
+        f"🔄 Cooldown: {SIGNAL_COOLDOWN}s\n"
+        f"⏳ First signals after ~15 minutes"
     )
 
     loop = asyncio.get_running_loop()
@@ -432,7 +508,7 @@ async def main() -> None:
         try:
             loop.add_signal_handler(sig, _handle_signal)
         except NotImplementedError:
-            pass  # Windows does not support add_signal_handler
+            pass
 
     await asyncio.gather(
         _run_bot_polling(db),
@@ -447,7 +523,6 @@ async def _shutdown(
     tg: TelegramService,
     monitor: Monitor,
 ) -> None:
-    """Graceful shutdown of all components"""
     logger.info("🛑 Shutting down...")
     monitor._running = False
     await monitor.stop()
