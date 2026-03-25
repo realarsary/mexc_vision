@@ -252,6 +252,74 @@ class MexcClient:
             logger.error(f"Klines parsing error {symbol}: {e}")
             return []
 
+    async def get_klines_ohlcv(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int = 200,
+    ) -> List[Dict]:
+        """
+        Get OHLCV candles as list of dicts.
+
+        Args:
+            symbol:   Trading pair, e.g. "BTC_USDT"
+            interval: "1m", "5m", "15m", "1h", etc.
+            limit:    Number of candles (max 2000)
+
+        Returns:
+            List of {"open","high","low","close","volume","time"}
+        """
+        mexc_interval = _to_mexc_interval(interval)
+        params = {"interval": mexc_interval, "limit": limit, "start": "", "end": ""}
+
+        try:
+            data = await self._get(f"/api/v1/contract/kline/{symbol}", params=params)
+        except APIError as e:
+            logger.error(f"OHLCV klines error {symbol} {interval}: {e}")
+            return []
+
+        try:
+            rows = data.get("data", {})
+            # MEXC contract kline: {"time":[...],"open":[...],"close":[...],"high":[...],"low":[...],"vol":[...]}
+            times  = rows.get("time",  [])
+            opens  = rows.get("open",  [])
+            closes = rows.get("close", [])
+            highs  = rows.get("high",  [])
+            lows   = rows.get("low",   [])
+            vols   = rows.get("vol",   rows.get("volume", []))
+
+            if times and opens:
+                return [
+                    {
+                        "time":   int(times[i]),
+                        "open":   float(opens[i]),
+                        "high":   float(highs[i]),
+                        "low":    float(lows[i]),
+                        "close":  float(closes[i]),
+                        "volume": float(vols[i]) if i < len(vols) else 0.0,
+                    }
+                    for i in range(len(times))
+                ]
+
+            # Fallback: list format [time, open, close, high, low, vol]
+            candles = rows if isinstance(rows, list) else []
+            result = []
+            for c in candles:
+                if len(c) >= 5:
+                    result.append({
+                        "time":   int(c[0]),
+                        "open":   float(c[1]),
+                        "close":  float(c[2]),
+                        "high":   float(c[3]),
+                        "low":    float(c[4]),
+                        "volume": float(c[5]) if len(c) > 5 else 0.0,
+                    })
+            return result
+
+        except (KeyError, IndexError, TypeError, ValueError) as e:
+            logger.error(f"OHLCV parsing error {symbol}: {e}")
+            return []
+
     async def get_ticker_price(self, symbol: str) -> Optional[float]:
         """Get current pair price"""
         try:

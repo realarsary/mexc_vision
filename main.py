@@ -339,10 +339,11 @@ class Monitor:
 
         chart_path = None
         if SEND_CHART:
+            # Fetch 5m OHLCV for chart (200 candles — last 200 for volume avg, display last 144)
+            candles_5m = await self._api.get_klines_ohlcv(symbol, "5m", limit=200)
             chart_path = self._chart.generate(
                 symbol=symbol,
-                prices_1h=prices_1h,
-                prices_15m=prices_15m,
+                candles_5m=candles_5m,
                 current_price=current_price,
                 direction=direction,
                 price_change=price_change,
@@ -499,10 +500,11 @@ async def main() -> None:
     )
 
     loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
 
     def _handle_signal():
         logger.info("🛑 Stop signal received")
-        asyncio.create_task(_shutdown(db, api, tg, monitor))
+        stop_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -510,11 +512,20 @@ async def main() -> None:
         except NotImplementedError:
             pass
 
-    await asyncio.gather(
-        _run_bot_polling(db),
-        monitor.start(symbols),
-        return_exceptions=True,
-    )
+    # Run bot + monitor as cancellable tasks
+    tasks = [
+        asyncio.create_task(_run_bot_polling(db)),
+        asyncio.create_task(monitor.start(symbols)),
+    ]
+
+    # Wait until stop signal
+    await stop_event.wait()
+
+    # Cancel tasks and shutdown cleanly
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    await _shutdown(db, api, tg, monitor)
 
 
 async def _shutdown(
