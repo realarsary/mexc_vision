@@ -10,6 +10,8 @@ from typing import Optional
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError
+from aiogram.types import BufferedInputFile
+
 
 from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
@@ -157,12 +159,16 @@ class TelegramService:
 
                 elif item["type"] == "photo":
                     with open(item["photo_path"], "rb") as f:
-                        await self._bot.send_photo(
-                            chat_id=item["chat_id"],
-                            photo=f,
-                            caption=item["caption"][:1024],  # Telegram limit
-                            parse_mode=item["parse_mode"],
+                        photo_data = BufferedInputFile(
+                            f.read(),
+                            filename=item["photo_path"].name
                         )
+                    await self._bot.send_photo(
+                        chat_id=item["chat_id"],
+                        photo=photo_data,
+                        caption=item["caption"][:1024],
+                        parse_mode=item["parse_mode"],
+                    )
                     self.sent_total += 1
                     self.sent_photos += 1
 
