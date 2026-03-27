@@ -140,7 +140,7 @@ class Monitor:
         self._api = api
         self._tg = tg
         self._chart = chart
-        self._cache = _KlinesCache(ttl=30.0)
+        self._cache = _KlinesCache(ttl=max(55.0, CHECK_INTERVAL - 5.0))
 
         self._symbols: List[str] = []
         self._ws: Optional[MexcWSClient] = None
@@ -402,6 +402,11 @@ def _get_direction(price_change: float, rsi_1h: float, rsi_15m: float) -> str:
         return "LONG"
     if not price_up and rsi_overbought:
         return "SHORT"
+    # Fallback: use RSI zone as primary signal (more reliable than price direction alone)
+    if rsi_overbought:
+        return "SHORT"
+    if rsi_oversold:
+        return "LONG"
     return "LONG" if price_up else "SHORT"
 
 
@@ -421,8 +426,8 @@ def _detect_rsi_divergence(candles: List, rsi_period: int = 14, lookback: int = 
         for c in candles:
             if isinstance(c, dict):
                 closes.append(float(c.get("close", c.get("c", 0))))
-            elif isinstance(c, (list, tuple)) and len(c) >= 3:
-                closes.append(float(c[2]))  # MEXC: [time, open, close, ...]
+            elif isinstance(c, (list, tuple)) and len(c) >= 5:
+                closes.append(float(c[4]))  # standard OHLCV: [time, open, high, low, close, ...]
             elif isinstance(c, (int, float)):
                 closes.append(float(c))
 
@@ -436,21 +441,23 @@ def _detect_rsi_divergence(candles: List, rsi_period: int = 14, lookback: int = 
         # Use last `lookback` bars
         price_window = closes[-lookback:]
         rsi_window = rsi_vals[-lookback:]
-        n = len(price_window)
 
-        # Find local lows (for bullish divergence)
-        def local_lows(arr, min_dist=5):
+        # Find local extrema with wider window (min_dist=10) to reduce noise.
+        # Require strict minimum over ±2 neighbours instead of just ±1.
+        def local_lows(arr, min_dist=10):
             lows = []
-            for i in range(1, len(arr) - 1):
-                if arr[i] < arr[i - 1] and arr[i] < arr[i + 1]:
+            for i in range(2, len(arr) - 2):
+                if arr[i] < arr[i - 1] and arr[i] < arr[i + 1] \
+                        and arr[i] <= arr[i - 2] and arr[i] <= arr[i + 2]:
                     if not lows or (i - lows[-1][0]) >= min_dist:
                         lows.append((i, arr[i]))
             return lows
 
-        def local_highs(arr, min_dist=5):
+        def local_highs(arr, min_dist=10):
             highs = []
-            for i in range(1, len(arr) - 1):
-                if arr[i] > arr[i - 1] and arr[i] > arr[i + 1]:
+            for i in range(2, len(arr) - 2):
+                if arr[i] > arr[i - 1] and arr[i] > arr[i + 1] \
+                        and arr[i] >= arr[i - 2] and arr[i] >= arr[i + 2]:
                     if not highs or (i - highs[-1][0]) >= min_dist:
                         highs.append((i, arr[i]))
             return highs
@@ -518,7 +525,13 @@ def _build_signal_message(
     div_line = ""
     if rsi_divergence:
         div_emoji = "📈" if "bullish" in rsi_divergence else "📉"
-        div_line = f"\n{div_emoji} RSI div 5m: <code>{rsi_divergence}</code>"
+        # Check if divergence confirms the signal direction
+        div_confirms = (
+            ("bullish" in rsi_divergence and direction == "LONG") or
+            ("bearish" in rsi_divergence and direction == "SHORT")
+        )
+        confirm_tag = " ✅ confirms signal" if div_confirms else " ⚠️ conflicts with signal"
+        div_line = f"\n{div_emoji} RSI div 5m: <code>{rsi_divergence}</code>{confirm_tag}"
 
     return (
         f"{emoji} <b>{symbol}</b> — {label}\n"
