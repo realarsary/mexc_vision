@@ -101,10 +101,6 @@ class ChartGenerator:
         rsi_full   = RSICalculator.calculate(all_closes, RSI_PERIOD)
         rsi_series = np.array(rsi_full[-n:], dtype=float)
 
-        # Volume line: avg of top-5 max from last 200 candles
-        vols_200 = np.array([c["volume"] for c in ohlcv[-VOLUME_LOOKBACK:]], dtype=float)
-        top5_avg = _top5_avg_volume(vols_200)
-
         x = np.arange(n)
 
         # --- Palette ---
@@ -194,9 +190,12 @@ class ChartGenerator:
         vcols = [vol_bull if closes[i] >= opens[i] else vol_bear for i in range(n)]
         ax_vol.bar(x, vols, color=vcols, width=0.6, alpha=0.9, zorder=2)
 
-        ax_vol.axhline(
-            top5_avg, color=avg_color, linewidth=1.3, linestyle="-", zorder=3,
-            label=f"Avg top-5 max  {_fmt_vol(top5_avg)}",
+        # Dynamic rolling top-5 avg line (computed per candle, not a flat line)
+        rolling_avg = _rolling_top5_avg(vols, window=5)
+        ax_vol.plot(
+            x, rolling_avg,
+            color=avg_color, linewidth=1.3, linestyle="-", zorder=3,
+            label=f"Roll top-5 avg  {_fmt_vol(float(rolling_avg[-1]))}",
         )
 
         ax_vol.set_ylabel("Объём", color=text_color, fontsize=9)
@@ -206,10 +205,10 @@ class ChartGenerator:
         ax_vol.legend(loc="upper left", fontsize=8, facecolor=bg_color,
                       labelcolor=text_color, edgecolor=grid_color)
 
-        # X-axis time labels
+        # X-axis time labels — date+time like MEXC web
         x_labels, x_ticks = _make_time_labels(display, max_labels=9)
         ax_vol.set_xticks(x_ticks)
-        ax_vol.set_xticklabels(x_labels, color=text_color, fontsize=7)
+        ax_vol.set_xticklabels(x_labels, color=text_color, fontsize=7, rotation=15, ha="right")
 
         fig.text(0.99, 0.005, f"MEXC Signal Bot · {_now_utc()}",
                  ha="right", va="bottom", color="#44445a", fontsize=7)
@@ -294,10 +293,35 @@ def _top5_avg_volume(vols: np.ndarray) -> float:
     return float(np.mean(top5))
 
 
+def _rolling_top5_avg(vols: np.ndarray, window: int = 5) -> np.ndarray:
+    """
+    Rolling average of top-5 max volumes within a sliding window.
+    For each candle i, takes the last `window` candles and computes avg of top-5.
+    Result is a dynamic line (not flat), similar to what MEXC shows.
+    """
+    result = np.zeros(len(vols), dtype=float)
+    for i in range(len(vols)):
+        start = max(0, i - window + 1)
+        chunk = vols[start:i + 1]
+        k = min(5, len(chunk))
+        if k == 0:
+            result[i] = 0.0
+        else:
+            top_k = np.partition(chunk, -k)[-k:]
+            result[i] = float(np.mean(top_k))
+    return result
+
+
 def _make_time_labels(ohlcv: List[Dict], max_labels: int = 9):
+    """
+    Generate X-axis time labels in MEXC web style:
+    - Shows date if day changes: "Mar 27\n14:00"
+    - Otherwise just time: "14:00"
+    """
     n     = len(ohlcv)
     ticks = np.linspace(0, n - 1, min(max_labels, n), dtype=int)
     labels = []
+    prev_day = None
     for i in ticks:
         t = ohlcv[i].get("time")
         if t is not None:
@@ -307,7 +331,13 @@ def _make_time_labels(ohlcv: List[Dict], max_labels: int = 9):
                 if ts > 1e10:
                     ts //= 1000
                 dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                labels.append(dt.strftime("%H:%M"))
+                day_str = dt.strftime("%b %d")
+                time_str = dt.strftime("%H:%M")
+                if prev_day is None or day_str != prev_day:
+                    labels.append(f"{day_str}\n{time_str}")
+                    prev_day = day_str
+                else:
+                    labels.append(time_str)
             except Exception:
                 labels.append(str(i))
         else:

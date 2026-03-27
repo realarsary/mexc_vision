@@ -271,6 +271,14 @@ class Monitor:
 
             logger.debug(f"✅ F3 passed: {symbol} RSI 15m={rsi_15m:.1f}")
 
+            # --- 24h volume ---
+            ticker_24h = await self._api.get_ticker_24h(symbol)
+            volume_24h = ticker_24h["volume24_usdt"] if ticker_24h else 0.0
+
+            # --- RSI 5m divergence ---
+            candles_5m_pre = await self._api.get_klines_ohlcv(symbol, "5m", limit=200)
+            rsi_divergence = _detect_rsi_divergence(candles_5m_pre)
+
             # --- ALL 3 FILTERS PASSED → SIGNAL ---
             direction = _get_direction(price_change, rsi_1h, rsi_15m)
             await self._handle_signal(
@@ -282,6 +290,9 @@ class Monitor:
                 direction=direction,
                 prices_1h=prices_1h,
                 prices_15m=prices_15m,
+                volume_24h=volume_24h,
+                rsi_divergence=rsi_divergence,
+                candles_5m=candles_5m_pre,
             )
 
         except Exception as e:
@@ -310,6 +321,9 @@ class Monitor:
         direction: str,
         prices_1h: List[float],
         prices_15m: List[float],
+        volume_24h: float = 0.0,
+        rsi_divergence: Optional[str] = None,
+        candles_5m: Optional[List] = None,
     ) -> None:
         await self._db.save_signal(
             symbol=symbol,
@@ -335,15 +349,17 @@ class Monitor:
             rsi_1h=rsi_1h,
             rsi_15m=rsi_15m,
             direction=direction,
+            volume_24h=volume_24h,
+            rsi_divergence=rsi_divergence,
         )
 
         chart_path = None
         if SEND_CHART:
-            # Fetch 5m OHLCV for chart (200 candles — last 200 for volume avg, display last 144)
-            candles_5m = await self._api.get_klines_ohlcv(symbol, "5m", limit=200)
+            # Use already-fetched 5m candles if available, else fetch
+            candles_5m_data = candles_5m if candles_5m else await self._api.get_klines_ohlcv(symbol, "5m", limit=200)
             chart_path = self._chart.generate(
                 symbol=symbol,
-                candles_5m=candles_5m,
+                candles_5m=candles_5m_data,
                 current_price=current_price,
                 direction=direction,
                 price_change=price_change,
@@ -351,7 +367,7 @@ class Monitor:
                 rsi_15m=rsi_15m,
             )
 
-        await self._tg.send_signal(text=text, photo_path=chart_path)
+        await self._tg.send_signal(text=text, photo_path=chart_path, symbol=symbol)
 
     def _log_stats(self) -> None:
         ws_metrics = self._ws.get_metrics() if self._ws else {}
@@ -389,6 +405,93 @@ def _get_direction(price_change: float, rsi_1h: float, rsi_15m: float) -> str:
     return "LONG" if price_up else "SHORT"
 
 
+def _detect_rsi_divergence(candles: List, rsi_period: int = 14, lookback: int = 50) -> Optional[str]:
+    """
+    Detect RSI divergence on 5m candles.
+    Returns: "bullish" | "bearish" | None
+
+    Bullish divergence:  price makes lower low, RSI makes higher low
+    Bearish divergence:  price makes higher high, RSI makes lower high
+    """
+    if not candles or len(candles) < rsi_period + lookback:
+        return None
+
+    try:
+        closes = []
+        for c in candles:
+            if isinstance(c, dict):
+                closes.append(float(c.get("close", c.get("c", 0))))
+            elif isinstance(c, (list, tuple)) and len(c) >= 3:
+                closes.append(float(c[2]))  # MEXC: [time, open, close, ...]
+            elif isinstance(c, (int, float)):
+                closes.append(float(c))
+
+        if len(closes) < rsi_period + 10:
+            return None
+
+        rsi_vals = RSICalculator.calculate(closes, rsi_period)
+        if not rsi_vals or len(rsi_vals) < lookback:
+            return None
+
+        # Use last `lookback` bars
+        price_window = closes[-lookback:]
+        rsi_window = rsi_vals[-lookback:]
+        n = len(price_window)
+
+        # Find local lows (for bullish divergence)
+        def local_lows(arr, min_dist=5):
+            lows = []
+            for i in range(1, len(arr) - 1):
+                if arr[i] < arr[i - 1] and arr[i] < arr[i + 1]:
+                    if not lows or (i - lows[-1][0]) >= min_dist:
+                        lows.append((i, arr[i]))
+            return lows
+
+        def local_highs(arr, min_dist=5):
+            highs = []
+            for i in range(1, len(arr) - 1):
+                if arr[i] > arr[i - 1] and arr[i] > arr[i + 1]:
+                    if not highs or (i - highs[-1][0]) >= min_dist:
+                        highs.append((i, arr[i]))
+            return highs
+
+        price_lows = local_lows(price_window)
+        rsi_lows = local_lows(rsi_window)
+        price_highs = local_highs(price_window)
+        rsi_highs = local_highs(rsi_window)
+
+        # Bullish: last 2 price lows — lower low, last 2 RSI lows — higher low
+        if len(price_lows) >= 2 and len(rsi_lows) >= 2:
+            p1, p2 = price_lows[-2][1], price_lows[-1][1]
+            r1, r2 = rsi_lows[-2][1], rsi_lows[-1][1]
+            if p2 < p1 and r2 > r1:
+                pct = abs(r2 - r1) / max(r1, 1) * 100
+                return f"bullish ({pct:.1f}%)"
+
+        # Bearish: last 2 price highs — higher high, last 2 RSI highs — lower high
+        if len(price_highs) >= 2 and len(rsi_highs) >= 2:
+            p1, p2 = price_highs[-2][1], price_highs[-1][1]
+            r1, r2 = rsi_highs[-2][1], rsi_highs[-1][1]
+            if p2 > p1 and r2 < r1:
+                pct = abs(r2 - r1) / max(r1, 1) * 100
+                return f"bearish ({pct:.1f}%)"
+
+    except Exception as e:
+        logger.debug(f"RSI divergence detection error: {e}")
+
+    return None
+
+
+def _fmt_volume_24h(vol: float) -> str:
+    if vol >= 1_000_000_000:
+        return f"{vol / 1_000_000_000:.2f}B"
+    if vol >= 1_000_000:
+        return f"{vol / 1_000_000:.2f}M"
+    if vol >= 1_000:
+        return f"{vol / 1_000:.1f}K"
+    return f"{vol:.0f}"
+
+
 def _build_signal_message(
     symbol: str,
     current_price: float,
@@ -396,6 +499,8 @@ def _build_signal_message(
     rsi_1h: float,
     rsi_15m: float,
     direction: str,
+    volume_24h: float = 0.0,
+    rsi_divergence: Optional[str] = None,
 ) -> str:
     emoji = "🟢" if direction == "LONG" else "🔴"
     label = "LONG (buy)" if direction == "LONG" else "SHORT (sell)"
@@ -403,12 +508,27 @@ def _build_signal_message(
     rsi_1h_zone = "overbought" if rsi_1h > RSI_OVERBOUGHT else "oversold"
     rsi_15m_zone = "overbought" if rsi_15m > RSI_OVERBOUGHT else "oversold"
 
+    # Symbol line — clickable inline code for easy copy
+    pair_display = symbol.replace("_", "/")
+
+    vol_line = ""
+    if volume_24h > 0:
+        vol_line = f"\n💹 Vol 24h:  <code>{_fmt_volume_24h(volume_24h)} USDT</code>"
+
+    div_line = ""
+    if rsi_divergence:
+        div_emoji = "📈" if "bullish" in rsi_divergence else "📉"
+        div_line = f"\n{div_emoji} RSI div 5m: <code>{rsi_divergence}</code>"
+
     return (
-        f"{emoji} <b>{symbol}</b> — {label}\n\n"
+        f"{emoji} <b>{symbol}</b> — {label}\n"
+        f"<code>{pair_display}</code>\n\n"
         f"💰 Price:    <code>{current_price:.6f} USDT</code>\n"
-        f"📈 Change: <code>{price_change:+.2f}%</code> over 15m\n\n"
+        f"📈 Change: <code>{price_change:+.2f}%</code> over 15m"
+        f"{vol_line}\n\n"
         f"📊 RSI (1h):  <code>{rsi_1h:.1f}</code> — {rsi_1h_zone}\n"
         f"📊 RSI (15m): <code>{rsi_15m:.1f}</code> — {rsi_15m_zone}"
+        f"{div_line}"
     )
 
 

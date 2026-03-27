@@ -99,11 +99,9 @@ class TelegramService:
         text: str,
         photo_path: Optional[Path] = None,
         chat_id: Optional[str] = None,
+        symbol: Optional[str] = None,  # kept for compat, not used
     ) -> None:
-        """
-        Send a signal — photo with caption if exists,
-        otherwise just text.
-        """
+        """Send a signal — photo with caption if exists, otherwise just text."""
         if photo_path and photo_path.exists():
             await self.send_photo(
                 photo_path=photo_path,

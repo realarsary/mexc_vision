@@ -333,6 +333,25 @@ class MexcClient:
             logger.error(f"Error getting price {symbol}: {e}")
             return None
 
+    async def get_ticker_24h(self, symbol: str) -> Optional[Dict]:
+        """Get 24h ticker data (volume, price change, etc.)"""
+        try:
+            data = await self._get(
+                "/api/v1/contract/ticker",
+                params={"symbol": symbol},
+            )
+            d = data.get("data", {})
+            if not d:
+                return None
+            # volume24 = turnover in USDT (MEXC returns volume24 as quote volume)
+            volume24 = d.get("volume24", d.get("amount24", 0))
+            return {
+                "volume24_usdt": float(volume24) if volume24 else 0.0,
+            }
+        except (APIError, ValueError, TypeError) as e:
+            logger.error(f"Error getting 24h ticker {symbol}: {e}")
+            return None
+
     async def get_all_symbols(self) -> List[str]:
         """Get all USDT futures trading pairs"""
         try:
